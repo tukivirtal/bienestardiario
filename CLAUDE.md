@@ -23,8 +23,8 @@ pip install -r requirements.txt   # also needs ffmpeg on the system (see Dockerf
 python app.py
 
 # Build & run the container
-docker build -t opioracional .
-docker run -p 10000:10000 opioracional
+docker build -t bienestardiario .
+docker run -p 10000:10000 bienestardiario
 
 # Smoke-test the endpoint
 curl -X POST http://localhost:10000/fabricar \
@@ -37,7 +37,7 @@ There is no test suite, linter, or build step beyond Docker.
 
 ## Deploy (Render)
 
-The service runs on Render (repo `github.com/tukivirtal/opioracional`, branch `main`), built from the `Dockerfile`.
+The service runs on Render (repo `github.com/tukivirtal/bienestardiario`, branch `main`), built from the `Dockerfile`.
 
 1. **Service type:** Web Service, Docker environment. Render builds the `Dockerfile` (which installs `ffmpeg` — required by moviepy). No build/start command overrides needed; the image's `CMD ["python", "app.py"]` serves the app.
 2. **Port:** the app binds `0.0.0.0:10000`. Render auto-detects the exposed port from the Dockerfile `EXPOSE 10000`. If you change the port, update `app.py`, the Dockerfile, and Render together.
