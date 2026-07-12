@@ -8,7 +8,8 @@ import numpy as np
 from dotenv import load_dotenv
 from flask import Flask, request, jsonify
 from PIL import Image, ImageDraw, ImageFont
-from moviepy.editor import ImageClip, AudioFileClip, concatenate_videoclips
+from moviepy.editor import ImageClip, AudioFileClip, VideoFileClip, concatenate_videoclips
+from moviepy.video.fx.all import crop
 import cloudinary
 import cloudinary.uploader
 
@@ -56,12 +57,42 @@ def efecto_ken_burns(clip, zoom_ratio=0.03):
     return clip.fl(efecto)
 
 
-def procesar_activo(job_id, titulo, imagenes_urls, ruta_audio):
+def generar_short(ruta_video_largo, ruta_short, duracion_short=45):
+    """Recorta los primeros N segundos del video largo y lo recompone en
+    vertical 9:16, recortando desde el centro del cuadro horizontal."""
+    clip_largo = VideoFileClip(ruta_video_largo)
+    duracion = min(duracion_short, clip_largo.duration)
+    fragmento = clip_largo.subclip(0, duracion)
+
+    ancho, alto = fragmento.size
+    ancho_objetivo = int(alto * 9 / 16)
+
+    if ancho_objetivo < ancho:
+        fragmento_vertical = crop(
+            fragmento,
+            width=ancho_objetivo,
+            height=alto,
+            x_center=ancho / 2,
+            y_center=alto / 2,
+        )
+    else:
+        # el video ya es más angosto que 9:16, lo dejamos como está
+        fragmento_vertical = fragmento
+
+    fragmento_vertical.write_videofile(ruta_short, fps=24, codec="libx264", audio_codec="aac")
+
+    fragmento_vertical.close()
+    fragmento.close()
+    clip_largo.close()
+
+
+def procesar_activo(job_id, titulo, imagenes_urls, ruta_audio, duracion_short):
     """Trabajo pesado que corre en un hilo de fondo. Usa rutas con el job_id
     para que jobs concurrentes no se pisen los archivos intermedios."""
     rutas_imagenes = [f"imagen_{job_id}_{i}.jpg" for i in range(len(imagenes_urls))]
     ruta_miniatura = f"miniatura_final_{job_id}.jpg"
     ruta_video = f"video_final_{job_id}.mp4"
+    ruta_short = f"short_{job_id}.mp4"
     ruta_fuente = "Anton-Regular.ttf"
 
     try:
@@ -114,10 +145,15 @@ def procesar_activo(job_id, titulo, imagenes_urls, ruta_audio):
         audio_clip.close()
         for clip in clips:
             clip.close()
+        video.close()
 
-        # 4. Subida Automática a Cloudinary
+        # 4. Generar el Short a partir del video largo ya renderizado
+        generar_short(ruta_video, ruta_short, duracion_short=duracion_short)
+
+        # 5. Subida Automática a Cloudinary (video largo + miniatura + short)
         url_miniatura_publica = ""
         url_video_publica = ""
+        url_short_publica = ""
 
         if os.path.exists(ruta_miniatura):
             upload_img = cloudinary.uploader.upload(ruta_miniatura, resource_type="image")
@@ -127,11 +163,16 @@ def procesar_activo(job_id, titulo, imagenes_urls, ruta_audio):
             upload_vid = cloudinary.uploader.upload(ruta_video, resource_type="video")
             url_video_publica = upload_vid.get("secure_url", "")
 
+        if os.path.exists(ruta_short):
+            upload_short = cloudinary.uploader.upload(ruta_short, resource_type="video")
+            url_short_publica = upload_short.get("secure_url", "")
+
         actualizar_estado(
             job_id,
             status="listo",
             url_video=url_video_publica,
             url_miniatura=url_miniatura_publica,
+            url_short=url_short_publica,
         )
 
     except Exception as e:
@@ -139,7 +180,7 @@ def procesar_activo(job_id, titulo, imagenes_urls, ruta_audio):
 
     finally:
         # Limpiar los archivos intermedios de este job
-        rutas_a_borrar = [ruta_audio, ruta_miniatura, ruta_video] + rutas_imagenes
+        rutas_a_borrar = [ruta_audio, ruta_miniatura, ruta_video, ruta_short] + rutas_imagenes
         for ruta in rutas_a_borrar:
             try:
                 if os.path.exists(ruta):
@@ -154,6 +195,11 @@ def fabricar_activo():
     titulo = request.form.get('titulo', 'EL SECRETO ESTOICO')
     imagenes_urls_raw = request.form.get('imagenes_urls', '')
     lista_urls = [u.strip() for u in imagenes_urls_raw.split(',') if u.strip()]
+
+    try:
+        duracion_short = int(request.form.get('duracion_short', 45))
+    except ValueError:
+        duracion_short = 45
 
     # 2. Validar entradas
     if 'audio' not in request.files:
@@ -170,7 +216,7 @@ def fabricar_activo():
     actualizar_estado(job_id, status="procesando")
     hilo = threading.Thread(
         target=procesar_activo,
-        args=(job_id, titulo, lista_urls, ruta_audio),
+        args=(job_id, titulo, lista_urls, ruta_audio, duracion_short),
         daemon=True,
     )
     hilo.start()
