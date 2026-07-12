@@ -1,0 +1,12 @@
+# Variables de entorno con credenciales
+.env
+
+# Archivos generados en tiempo de ejecución
+audio_recibido.mp3
+imagen_base.jpg
+miniatura_final.jpg
+video_final.mp4
+
+# Python
+__pycache__/
+*.pyc

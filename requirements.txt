@@ -1,0 +1,6 @@
+Flask==3.0.0
+moviepy==1.0.3
+Pillow==10.2.0
+requests
+cloudinary
+python-dotenv
