@@ -4,3 +4,4 @@ Pillow==10.2.0
 requests
 cloudinary
 python-dotenv
+pydub
