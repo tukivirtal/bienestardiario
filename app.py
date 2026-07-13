@@ -10,6 +10,7 @@ from flask import Flask, request, jsonify
 from PIL import Image, ImageDraw, ImageFont
 from moviepy.editor import ImageClip, AudioFileClip, VideoFileClip, concatenate_videoclips
 from moviepy.video.fx.all import crop
+from pydub import AudioSegment
 import cloudinary
 import cloudinary.uploader
 
@@ -86,7 +87,7 @@ def generar_short(ruta_video_largo, ruta_short, duracion_short=45):
     clip_largo.close()
 
 
-def procesar_activo(job_id, titulo, imagenes_urls, ruta_audio, duracion_short):
+def procesar_activo(job_id, titulo, imagenes_urls, rutas_audio_partes, duracion_short):
     """Trabajo pesado que corre en un hilo de fondo. Usa rutas con el job_id
     para que jobs concurrentes no se pisen los archivos intermedios."""
     rutas_imagenes = [f"imagen_{job_id}_{i}.jpg" for i in range(len(imagenes_urls))]
@@ -94,15 +95,23 @@ def procesar_activo(job_id, titulo, imagenes_urls, ruta_audio, duracion_short):
     ruta_video = f"video_final_{job_id}.mp4"
     ruta_short = f"short_{job_id}.mp4"
     ruta_fuente = "Anton-Regular.ttf"
+    ruta_audio = f"audio_unido_{job_id}.mp3"
 
     try:
+        # 0. Unir las partes de audio (ElevenLabs las manda separadas por el
+        # límite de 10.000 caracteres por request; acá se juntan en un solo mp3)
+        audio_unido = AudioSegment.empty()
+        for parte in rutas_audio_partes:
+            audio_unido += AudioSegment.from_file(parte)
+        audio_unido.export(ruta_audio, format="mp3")
+
         # 1. Descargar todas las imágenes (Leonardo AI)
         for url, ruta in zip(imagenes_urls, rutas_imagenes):
             respuesta_img = requests.get(url)
             with open(ruta, 'wb') as f:
                 f.write(respuesta_img.content)
 
-        # 2. Fabricar la Miniatura (se arma con la PRIMERA imagen, igual que antes)
+        # 2. Fabricar la Miniatura (se arma con la PRIMERA imagen)
         ruta_imagen_portada = rutas_imagenes[0]
         if os.path.exists(ruta_fuente) and os.path.exists(ruta_imagen_portada):
             imagen = Image.open(ruta_imagen_portada)
@@ -180,7 +189,7 @@ def procesar_activo(job_id, titulo, imagenes_urls, ruta_audio, duracion_short):
 
     finally:
         # Limpiar los archivos intermedios de este job
-        rutas_a_borrar = [ruta_audio, ruta_miniatura, ruta_video, ruta_short] + rutas_imagenes
+        rutas_a_borrar = [ruta_audio, ruta_miniatura, ruta_video, ruta_short] + rutas_imagenes + rutas_audio_partes
         for ruta in rutas_a_borrar:
             try:
                 if os.path.exists(ruta):
@@ -202,21 +211,27 @@ def fabricar_activo():
         duracion_short = 45
 
     # 2. Validar entradas
-    if 'audio' not in request.files:
-        return jsonify({"status": "error", "mensaje": "Falta el archivo de audio"}), 400
     if not lista_urls:
         return jsonify({"status": "error", "mensaje": "Falta imagenes_urls"}), 400
 
-    # 3. Guardar el audio AHORA (el FileStorage del request no sobrevive al hilo)
+    # 3. Guardar todas las partes de audio recibidas (audio_parte_1, audio_parte_2, ...)
     job_id = uuid.uuid4().hex
-    ruta_audio = f"audio_recibido_{job_id}.mp3"
-    request.files['audio'].save(ruta_audio)
+    rutas_audio_partes = []
+    i = 1
+    while f'audio_parte_{i}' in request.files:
+        ruta_parte = f"audio_parte_{i}_{job_id}.mp3"
+        request.files[f'audio_parte_{i}'].save(ruta_parte)
+        rutas_audio_partes.append(ruta_parte)
+        i += 1
+
+    if not rutas_audio_partes:
+        return jsonify({"status": "error", "mensaje": "Faltan las partes de audio (audio_parte_1, audio_parte_2, ...)"}), 400
 
     # 4. Registrar el job y disparar el procesamiento en segundo plano
     actualizar_estado(job_id, status="procesando")
     hilo = threading.Thread(
         target=procesar_activo,
-        args=(job_id, titulo, lista_urls, ruta_audio, duracion_short),
+        args=(job_id, titulo, lista_urls, rutas_audio_partes, duracion_short),
         daemon=True,
     )
     hilo.start()
