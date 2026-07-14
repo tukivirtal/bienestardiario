@@ -99,7 +99,8 @@ def generar_short(ruta_video_largo, ruta_short, duracion_short=45):
     clip_largo.close()
 
 
-def procesar_activo(job_id, titulo, imagenes_urls, rutas_audio_partes, duracion_short, webhook_url=None):
+def procesar_activo(job_id, titulo, imagenes_urls, rutas_audio_partes, duracion_short, webhook_url=None,
+                     descripcion_seo="", hashtags="", etiquetas_ocultas=""):
     """Trabajo pesado que corre en un hilo de fondo. Usa rutas con el job_id
     para que jobs concurrentes no se pisen los archivos intermedios."""
     rutas_imagenes = [f"imagen_{job_id}_{i}.jpg" for i in range(len(imagenes_urls))]
@@ -194,6 +195,10 @@ def procesar_activo(job_id, titulo, imagenes_urls, rutas_audio_partes, duracion_
             "url_video": url_video_publica,
             "url_miniatura": url_miniatura_publica,
             "url_short": url_short_publica,
+            "titulo_seo": titulo,
+            "descripcion_seo": descripcion_seo,
+            "hashtags": hashtags,
+            "etiquetas_ocultas": etiquetas_ocultas,
         }
         actualizar_estado(job_id, **resultado)
         notificar_webhook(webhook_url, resultado)
@@ -221,6 +226,11 @@ def fabricar_activo():
     imagenes_urls_raw = request.form.get('imagenes_urls', '')
     lista_urls = [u.strip() for u in imagenes_urls_raw.split(',') if u.strip()]
     webhook_url = request.form.get('webhook_url')  # opcional: URL de callback de Make
+    # Metadata SEO que solo se necesita más adelante (YouTube Upload), en el
+    # escenario del webhook — viaja "de pasada" para no perderla al cortar acá.
+    descripcion_seo = request.form.get('descripcion_seo', '')
+    hashtags = request.form.get('hashtags', '')
+    etiquetas_ocultas = request.form.get('etiquetas_ocultas', '')
 
     try:
         duracion_short = int(request.form.get('duracion_short', 45))
@@ -248,7 +258,8 @@ def fabricar_activo():
     actualizar_estado(job_id, status="procesando")
     hilo = threading.Thread(
         target=procesar_activo,
-        args=(job_id, titulo, lista_urls, rutas_audio_partes, duracion_short, webhook_url),
+        args=(job_id, titulo, lista_urls, rutas_audio_partes, duracion_short, webhook_url,
+              descripcion_seo, hashtags, etiquetas_ocultas),
         daemon=True,
     )
     hilo.start()
