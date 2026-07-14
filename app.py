@@ -13,43 +13,17 @@ from moviepy.video.fx.all import crop
 from pydub import AudioSegment
 import cloudinary
 import cloudinary.uploader
-import requests
 
-@app.route('/fabricar', methods=['POST'])
-def fabricar():
-    datos = request.json
-    webhook_url = datos.get('webhook_url')  # nuevo parámetro
-    job_id = ...  # como ya lo generás
-
-    def procesar_en_background():
-        # ... tu lógica actual de render ...
-        resultado = {
-            "job_id": job_id,
-            "status": "completado",
-            "url_video": url_video,
-            "url_miniatura": url_miniatura,
-            "url_short": url_short
-        }
-        estados[job_id] = resultado  # como ya lo hacés
-
-        if webhook_url:
-            try:
-                requests.post(webhook_url, json=resultado, timeout=10)
-            except Exception as e:
-                print(f"Error notificando webhook: {e}")
-
-    threading.Thread(target=procesar_en_background).start()
-    return jsonify({"job_id": job_id}), 202
 load_dotenv()
 
 app = Flask(__name__)
 
-# 🛠️ CONFIGURACIÓN DE CLOUDINARY: valores tomados de variables de entorno (ver .env.example)
+# CONFIGURACIÓN DE CLOUDINARY: valores tomados de variables de entorno (ver .env.example)
 cloudinary.config(
-  cloud_name = os.environ.get("CLOUDINARY_CLOUD_NAME"),
-  api_key = os.environ.get("CLOUDINARY_API_KEY"),
-  api_secret = os.environ.get("CLOUDINARY_API_SECRET"),
-  secure = True
+    cloud_name=os.environ.get("CLOUDINARY_CLOUD_NAME"),
+    api_key=os.environ.get("CLOUDINARY_API_KEY"),
+    api_secret=os.environ.get("CLOUDINARY_API_SECRET"),
+    secure=True
 )
 
 # Estado de los jobs en memoria (por ahora). Clave: job_id -> dict de estado.
@@ -61,6 +35,18 @@ jobs_lock = threading.Lock()
 def actualizar_estado(job_id, **campos):
     with jobs_lock:
         jobs.setdefault(job_id, {}).update(campos)
+
+
+def notificar_webhook(webhook_url, resultado):
+    """Avisa a Make (u otro consumidor) que el job terminó, mandando el
+    resultado final por POST. Si falla, no rompe el procesamiento: solo
+    se loguea, porque el /estado/<job_id> sigue disponible como respaldo."""
+    if not webhook_url:
+        return
+    try:
+        requests.post(webhook_url, json=resultado, timeout=10)
+    except Exception as e:
+        print(f"Error notificando webhook: {e}")
 
 
 def efecto_ken_burns(clip, zoom_ratio=0.03):
@@ -113,7 +99,7 @@ def generar_short(ruta_video_largo, ruta_short, duracion_short=45):
     clip_largo.close()
 
 
-def procesar_activo(job_id, titulo, imagenes_urls, rutas_audio_partes, duracion_short):
+def procesar_activo(job_id, titulo, imagenes_urls, rutas_audio_partes, duracion_short, webhook_url=None):
     """Trabajo pesado que corre en un hilo de fondo. Usa rutas con el job_id
     para que jobs concurrentes no se pisen los archivos intermedios."""
     rutas_imagenes = [f"imagen_{job_id}_{i}.jpg" for i in range(len(imagenes_urls))]
@@ -202,16 +188,20 @@ def procesar_activo(job_id, titulo, imagenes_urls, rutas_audio_partes, duracion_
             upload_short = cloudinary.uploader.upload(ruta_short, resource_type="video")
             url_short_publica = upload_short.get("secure_url", "")
 
-        actualizar_estado(
-            job_id,
-            status="listo",
-            url_video=url_video_publica,
-            url_miniatura=url_miniatura_publica,
-            url_short=url_short_publica,
-        )
+        resultado = {
+            "job_id": job_id,
+            "status": "listo",
+            "url_video": url_video_publica,
+            "url_miniatura": url_miniatura_publica,
+            "url_short": url_short_publica,
+        }
+        actualizar_estado(job_id, **resultado)
+        notificar_webhook(webhook_url, resultado)
 
     except Exception as e:
-        actualizar_estado(job_id, status="error", mensaje=str(e))
+        resultado_error = {"job_id": job_id, "status": "error", "mensaje": str(e)}
+        actualizar_estado(job_id, **resultado_error)
+        notificar_webhook(webhook_url, resultado_error)
 
     finally:
         # Limpiar los archivos intermedios de este job
@@ -230,6 +220,7 @@ def fabricar_activo():
     titulo = request.form.get('titulo', 'EL SECRETO ESTOICO')
     imagenes_urls_raw = request.form.get('imagenes_urls', '')
     lista_urls = [u.strip() for u in imagenes_urls_raw.split(',') if u.strip()]
+    webhook_url = request.form.get('webhook_url')  # opcional: URL de callback de Make
 
     try:
         duracion_short = int(request.form.get('duracion_short', 45))
@@ -257,7 +248,7 @@ def fabricar_activo():
     actualizar_estado(job_id, status="procesando")
     hilo = threading.Thread(
         target=procesar_activo,
-        args=(job_id, titulo, lista_urls, rutas_audio_partes, duracion_short),
+        args=(job_id, titulo, lista_urls, rutas_audio_partes, duracion_short, webhook_url),
         daemon=True,
     )
     hilo.start()
