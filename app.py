@@ -13,7 +13,33 @@ from moviepy.video.fx.all import crop
 from pydub import AudioSegment
 import cloudinary
 import cloudinary.uploader
+import requests
 
+@app.route('/fabricar', methods=['POST'])
+def fabricar():
+    datos = request.json
+    webhook_url = datos.get('webhook_url')  # nuevo parámetro
+    job_id = ...  # como ya lo generás
+
+    def procesar_en_background():
+        # ... tu lógica actual de render ...
+        resultado = {
+            "job_id": job_id,
+            "status": "completado",
+            "url_video": url_video,
+            "url_miniatura": url_miniatura,
+            "url_short": url_short
+        }
+        estados[job_id] = resultado  # como ya lo hacés
+
+        if webhook_url:
+            try:
+                requests.post(webhook_url, json=resultado, timeout=10)
+            except Exception as e:
+                print(f"Error notificando webhook: {e}")
+
+    threading.Thread(target=procesar_en_background).start()
+    return jsonify({"job_id": job_id}), 202
 load_dotenv()
 
 app = Flask(__name__)
