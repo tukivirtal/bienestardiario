@@ -130,16 +130,84 @@ def generar_short(ruta_video_largo, ruta_short, duracion_short=45):
         raise RuntimeError(f"ffmpeg falló al generar el short: {resultado.stderr[-2000:]}")
 
 
+def _formato_srt(segundos):
+    """Convierte segundos (float) al formato de timestamp que usa .srt:
+    HH:MM:SS,mmm"""
+    horas = int(segundos // 3600)
+    minutos = int((segundos % 3600) // 60)
+    segs = int(segundos % 60)
+    milisegundos = int(round((segundos - int(segundos)) * 1000))
+    return f"{horas:02d}:{minutos:02d}:{segs:02d},{milisegundos:03d}"
+
+
+def generar_subtitulos(ruta_audio, ruta_srt, palabras_por_bloque=8):
+    """Transcribe el audio con ElevenLabs Scribe (mismo proveedor/cuenta que
+    ya usás para la narración, evita pelear con tarjetas rechazadas en otro
+    proveedor). A diferencia de Whisper de OpenAI, esta API no devuelve el
+    .srt directo — da timestamps palabra por palabra, así que los agrupamos
+    en bloques de N palabras y armamos el .srt nosotros."""
+    api_key = os.environ.get("ELEVENLABS_API_KEY")
+    with open(ruta_audio, "rb") as f:
+        respuesta = requests.post(
+            "https://api.elevenlabs.io/v1/speech-to-text",
+            headers={"xi-api-key": api_key},
+            data={"model_id": "scribe_v2", "timestamps_granularity": "word"},
+            files={"file": f},
+            timeout=300,
+        )
+    respuesta.raise_for_status()
+    palabras = [w for w in respuesta.json().get("words", []) if w.get("type") == "word"]
+
+    bloques = []
+    for i in range(0, len(palabras), palabras_por_bloque):
+        grupo = palabras[i:i + palabras_por_bloque]
+        if not grupo:
+            continue
+        texto = " ".join(w["text"] for w in grupo)
+        bloques.append((grupo[0]["start"], grupo[-1]["end"], texto))
+
+    with open(ruta_srt, "w", encoding="utf-8") as f:
+        for idx, (inicio, fin, texto) in enumerate(bloques, start=1):
+            f.write(f"{idx}\n")
+            f.write(f"{_formato_srt(inicio)} --> {_formato_srt(fin)}\n")
+            f.write(f"{texto}\n\n")
+
+
+def quemar_subtitulos(ruta_video_entrada, ruta_srt, ruta_video_salida):
+    """Quema los subtítulos sobre el video ya renderizado (filtro subtitles,
+    vía libass). Estilo: blanco con borde negro, centrado abajo."""
+    estilo = (
+        "FontName=Arial,FontSize=22,PrimaryColour=&H00FFFFFF,"
+        "OutlineColour=&H00000000,BorderStyle=3,Outline=2,Alignment=2,MarginV=60"
+    )
+    filtro = f"subtitles={ruta_srt}:force_style='{estilo}'"
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", ruta_video_entrada,
+        "-vf", filtro,
+        "-c:v", "libx264",
+        "-preset", "veryfast",
+        "-crf", "20",
+        "-c:a", "copy",
+        ruta_video_salida,
+    ]
+    resultado = subprocess.run(cmd, capture_output=True, text=True)
+    if resultado.returncode != 0:
+        raise RuntimeError(f"ffmpeg falló al quemar subtítulos: {resultado.stderr[-2000:]}")
+
+
 def procesar_activo(job_id, titulo, imagenes_urls, rutas_audio_partes, duracion_short, webhook_url=None,
                      descripcion_seo="", hashtags="", etiquetas_ocultas=""):
     """Trabajo pesado que corre en un hilo de fondo. Usa rutas con el job_id
     para que jobs concurrentes no se pisen los archivos intermedios."""
     rutas_imagenes = [f"imagen_{job_id}_{i}.jpg" for i in range(len(imagenes_urls))]
     ruta_miniatura = f"miniatura_final_{job_id}.jpg"
+    ruta_video_sin_subs = f"video_sin_subs_{job_id}.mp4"
     ruta_video = f"video_final_{job_id}.mp4"
     ruta_short = f"short_{job_id}.mp4"
     ruta_fuente = "Anton-Regular.ttf"
     ruta_audio = f"audio_unido_{job_id}.mp3"
+    ruta_srt = f"subtitulos_{job_id}.srt"
 
     try:
         # 0. Unir las partes de audio (ElevenLabs las manda separadas por el
@@ -182,9 +250,15 @@ def procesar_activo(job_id, titulo, imagenes_urls, rutas_audio_partes, duracion_
         # 3. Fabricar el Video: multi-imagen + Ken Burns (zoompan) + crossfade (xfade),
         # todo vía ffmpeg directo — reemplaza el pipeline anterior de moviepy/PIL.
         duracion_total = len(audio_unido) / 1000.0  # pydub mide en milisegundos
-        construir_video_ffmpeg(rutas_imagenes, ruta_audio, ruta_video, duracion_total)
+        construir_video_ffmpeg(rutas_imagenes, ruta_audio, ruta_video_sin_subs, duracion_total)
 
-        # 4. Generar el Short a partir del video largo ya renderizado
+        # 3.5. Transcribir el audio con ElevenLabs Scribe para generar los subtítulos
+        generar_subtitulos(ruta_audio, ruta_srt)
+
+        # 3.6. Quemar los subtítulos sobre el video ya renderizado
+        quemar_subtitulos(ruta_video_sin_subs, ruta_srt, ruta_video)
+
+        # 4. Generar el Short a partir del video largo YA CON subtítulos quemados
         generar_short(ruta_video, ruta_short, duracion_short=duracion_short)
 
         # 5. Subida Automática a Cloudinary (video largo + miniatura + short)
@@ -225,7 +299,7 @@ def procesar_activo(job_id, titulo, imagenes_urls, rutas_audio_partes, duracion_
 
     finally:
         # Limpiar los archivos intermedios de este job
-        rutas_a_borrar = [ruta_audio, ruta_miniatura, ruta_video, ruta_short] + rutas_imagenes + rutas_audio_partes
+        rutas_a_borrar = [ruta_audio, ruta_miniatura, ruta_video_sin_subs, ruta_video, ruta_short, ruta_srt] + rutas_imagenes + rutas_audio_partes
         for ruta in rutas_a_borrar:
             try:
                 if os.path.exists(ruta):
