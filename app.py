@@ -1,15 +1,12 @@
 import os
-import math
 import uuid
 import threading
+import subprocess
 import requests
 import textwrap
-import numpy as np
 from dotenv import load_dotenv
 from flask import Flask, request, jsonify
 from PIL import Image, ImageDraw, ImageFont
-from moviepy.editor import ImageClip, AudioFileClip, VideoFileClip, concatenate_videoclips
-from moviepy.video.fx.all import crop
 from pydub import AudioSegment
 import cloudinary
 import cloudinary.uploader
@@ -49,54 +46,88 @@ def notificar_webhook(webhook_url, resultado):
         print(f"Error notificando webhook: {e}")
 
 
-def efecto_ken_burns(clip, zoom_ratio=0.03):
-    """Aplica un zoom lento y progresivo sobre el clip (efecto Ken Burns)."""
-    def efecto(get_frame, t):
-        img = Image.fromarray(get_frame(t))
-        base_size = img.size
-        new_size = [
-            math.ceil(img.size[0] * (1 + (zoom_ratio * t))),
-            math.ceil(img.size[1] * (1 + (zoom_ratio * t)))
-        ]
-        new_size[0] += new_size[0] % 2
-        new_size[1] += new_size[1] % 2
-        img = img.resize(new_size, Image.LANCZOS)
-        x = math.ceil((new_size[0] - base_size[0]) / 2)
-        y = math.ceil((new_size[1] - base_size[1]) / 2)
-        img = img.crop((x, y, new_size[0] - x, new_size[1] - y)).resize(base_size, Image.LANCZOS)
-        resultado = np.array(img)
-        img.close()
-        return resultado
-    return clip.fl(efecto)
+def construir_video_ffmpeg(rutas_imagenes, ruta_audio, ruta_salida, duracion_total,
+                            fps=24, ancho=1920, alto=1080, duracion_transicion=1.0):
+    """Arma el video multi-imagen con Ken Burns (filtro zoompan, nativo de ffmpeg,
+    corre en C en vez de Python/PIL cuadro por cuadro) + crossfade entre escenas
+    (filtro xfade). Reemplaza el approach anterior de moviepy+PIL, mucho más lento
+    porque procesaba cada frame en Python puro."""
+    n = len(rutas_imagenes)
+    duracion_por_imagen = duracion_total / n
+    # cada clip dura un poco más que su porción para poder solaparse en el xfade
+    duracion_clip = duracion_por_imagen + duracion_transicion
+    frames_por_clip = int(round(duracion_clip * fps))
+    # escala previa al zoompan: 2x el ancho objetivo alcanza para zoom hasta 1.5x
+    # sin pixelar, y es mucho más rápido que sobre-escalar a un tamaño fijo enorme
+    escala_previa = ancho * 2
+
+    cmd = ["ffmpeg", "-y"]
+    for ruta in rutas_imagenes:
+        cmd += ["-loop", "1", "-t", f"{duracion_clip:.3f}", "-i", ruta]
+    cmd += ["-i", ruta_audio]
+
+    filtros = []
+    for i in range(n):
+        zoom_in = (i % 2 == 0)
+        if zoom_in:
+            zoom_expr = "min(zoom+0.0015,1.5)"
+            x_expr = f"iw/2-(iw/zoom/2)+(on/{frames_por_clip})*40"
+        else:
+            zoom_expr = "if(eq(on,0),1.5,max(zoom-0.0015,1.0))"
+            x_expr = f"iw/2-(iw/zoom/2)-(on/{frames_por_clip})*40"
+        y_expr = "ih/2-(ih/zoom/2)"
+        filtros.append(
+            f"[{i}:v]scale={escala_previa}:-1,zoompan=z='{zoom_expr}':x='{x_expr}':y='{y_expr}'"
+            f":d={frames_por_clip}:s={ancho}x{alto}:fps={fps},setsar=1[v{i}]"
+        )
+
+    encadenado = "v0"
+    offset_acumulado = duracion_clip - duracion_transicion
+    for i in range(1, n):
+        salida = f"vx{i}"
+        filtros.append(
+            f"[{encadenado}][v{i}]xfade=transition=fade:duration={duracion_transicion}:"
+            f"offset={offset_acumulado:.3f}[{salida}]"
+        )
+        encadenado = salida
+        offset_acumulado += duracion_clip - duracion_transicion
+
+    cmd += [
+        "-filter_complex", ";".join(filtros),
+        "-map", f"[{encadenado}]",
+        "-map", f"{n}:a",
+        "-c:v", "libx264",
+        "-preset", "veryfast",
+        "-crf", "20",
+        "-c:a", "aac",
+        "-shortest",
+        ruta_salida,
+    ]
+
+    resultado = subprocess.run(cmd, capture_output=True, text=True)
+    if resultado.returncode != 0:
+        raise RuntimeError(f"ffmpeg falló al construir el video: {resultado.stderr[-2000:]}")
 
 
 def generar_short(ruta_video_largo, ruta_short, duracion_short=45):
     """Recorta los primeros N segundos del video largo y lo recompone en
-    vertical 9:16, recortando desde el centro del cuadro horizontal."""
-    clip_largo = VideoFileClip(ruta_video_largo)
-    duracion = min(duracion_short, clip_largo.duration)
-    fragmento = clip_largo.subclip(0, duracion)
-
-    ancho, alto = fragmento.size
-    ancho_objetivo = int(alto * 9 / 16)
-
-    if ancho_objetivo < ancho:
-        fragmento_vertical = crop(
-            fragmento,
-            width=ancho_objetivo,
-            height=alto,
-            x_center=ancho / 2,
-            y_center=alto / 2,
-        )
-    else:
-        # el video ya es más angosto que 9:16, lo dejamos como está
-        fragmento_vertical = fragmento
-
-    fragmento_vertical.write_videofile(ruta_short, fps=24, codec="libx264", audio_codec="aac")
-
-    fragmento_vertical.close()
-    fragmento.close()
-    clip_largo.close()
+    vertical 9:16, recortando desde el centro del cuadro horizontal.
+    Usa ffmpeg directo (crop + trim) en vez de moviepy, mismo motivo: velocidad."""
+    filtro_crop = "crop=ih*9/16:ih:(iw-ih*9/16)/2:0"
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", ruta_video_largo,
+        "-t", str(duracion_short),
+        "-vf", filtro_crop,
+        "-c:v", "libx264",
+        "-preset", "veryfast",
+        "-crf", "20",
+        "-c:a", "aac",
+        ruta_short,
+    ]
+    resultado = subprocess.run(cmd, capture_output=True, text=True)
+    if resultado.returncode != 0:
+        raise RuntimeError(f"ffmpeg falló al generar el short: {resultado.stderr[-2000:]}")
 
 
 def procesar_activo(job_id, titulo, imagenes_urls, rutas_audio_partes, duracion_short, webhook_url=None,
@@ -148,26 +179,10 @@ def procesar_activo(job_id, titulo, imagenes_urls, rutas_audio_partes, duracion_
 
             imagen.save(ruta_miniatura)
 
-        # 3. Fabricar el Video: multi-imagen + Ken Burns + crossfade entre escenas
-        audio_clip = AudioFileClip(ruta_audio)
-        duracion_total = audio_clip.duration
-        duracion_por_imagen = duracion_total / len(rutas_imagenes)
-
-        clips = []
-        for ruta in rutas_imagenes:
-            clip = ImageClip(ruta).set_duration(duracion_por_imagen + 1)
-            clip = efecto_ken_burns(clip, zoom_ratio=0.03)
-            clip = clip.crossfadein(1)
-            clips.append(clip)
-
-        video = concatenate_videoclips(clips, method="compose", padding=-1)
-        video = video.set_duration(duracion_total).set_audio(audio_clip)
-        video.write_videofile(ruta_video, fps=24, codec="libx264", audio_codec="aac")
-
-        audio_clip.close()
-        for clip in clips:
-            clip.close()
-        video.close()
+        # 3. Fabricar el Video: multi-imagen + Ken Burns (zoompan) + crossfade (xfade),
+        # todo vía ffmpeg directo — reemplaza el pipeline anterior de moviepy/PIL.
+        duracion_total = len(audio_unido) / 1000.0  # pydub mide en milisegundos
+        construir_video_ffmpeg(rutas_imagenes, ruta_audio, ruta_video, duracion_total)
 
         # 4. Generar el Short a partir del video largo ya renderizado
         generar_short(ruta_video, ruta_short, duracion_short=duracion_short)
