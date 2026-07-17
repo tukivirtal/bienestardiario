@@ -197,7 +197,7 @@ def quemar_subtitulos(ruta_video_entrada, ruta_srt, ruta_video_salida):
 
 
 def procesar_activo(job_id, titulo, imagenes_urls, rutas_audio_partes, duracion_short, webhook_url=None,
-                     descripcion_seo="", hashtags="", etiquetas_ocultas=""):
+                     descripcion_seo="", hashtags="", etiquetas_ocultas="", fila=""):
     """Trabajo pesado que corre en un hilo de fondo. Usa rutas con el job_id
     para que jobs concurrentes no se pisen los archivos intermedios."""
     rutas_imagenes = [f"imagen_{job_id}_{i}.jpg" for i in range(len(imagenes_urls))]
@@ -288,12 +288,13 @@ def procesar_activo(job_id, titulo, imagenes_urls, rutas_audio_partes, duracion_
             "descripcion_seo": descripcion_seo,
             "hashtags": hashtags,
             "etiquetas_ocultas": etiquetas_ocultas,
+            "fila": fila,
         }
         actualizar_estado(job_id, **resultado)
         notificar_webhook(webhook_url, resultado)
 
     except Exception as e:
-        resultado_error = {"job_id": job_id, "status": "error", "mensaje": str(e)}
+        resultado_error = {"job_id": job_id, "status": "error", "mensaje": str(e), "fila": fila}
         actualizar_estado(job_id, **resultado_error)
         notificar_webhook(webhook_url, resultado_error)
 
@@ -320,6 +321,7 @@ def fabricar_activo():
     descripcion_seo = request.form.get('descripcion_seo', '')
     hashtags = request.form.get('hashtags', '')
     etiquetas_ocultas = request.form.get('etiquetas_ocultas', '')
+    fila = request.form.get('fila', '')  # número de fila del Sheet, para poder actualizarla desde el escenario del webhook
 
     try:
         duracion_short = int(request.form.get('duracion_short', 45))
@@ -348,7 +350,7 @@ def fabricar_activo():
     hilo = threading.Thread(
         target=procesar_activo,
         args=(job_id, titulo, lista_urls, rutas_audio_partes, duracion_short, webhook_url,
-              descripcion_seo, hashtags, etiquetas_ocultas),
+              descripcion_seo, hashtags, etiquetas_ocultas, fila),
         daemon=True,
     )
     hilo.start()
