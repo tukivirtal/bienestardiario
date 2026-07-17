@@ -28,6 +28,14 @@ cloudinary.config(
 jobs = {}
 jobs_lock = threading.Lock()
 
+# Limita a 1 solo render de video en simultáneo. Render Starter tiene apenas
+# 512MB de RAM — si Make dispara varios POST /fabricar seguidos (reintentos,
+# o corridas manuales encimadas), sin este límite cada uno arranca su propio
+# proceso de ffmpeg al mismo tiempo y se quedan sin memoria entre todos,
+# tirando el servidor entero abajo (esto ya pasó una vez). Con el semáforo,
+# los jobs de más simplemente esperan su turno en vez de competir por RAM.
+semaforo_render = threading.Semaphore(1)
+
 
 def actualizar_estado(job_id, **campos):
     with jobs_lock:
@@ -57,9 +65,10 @@ def construir_video_ffmpeg(rutas_imagenes, ruta_audio, ruta_salida, duracion_tot
     # cada clip dura un poco más que su porción para poder solaparse en el xfade
     duracion_clip = duracion_por_imagen + duracion_transicion
     frames_por_clip = int(round(duracion_clip * fps))
-    # escala previa al zoompan: 2x el ancho objetivo alcanza para zoom hasta 1.5x
-    # sin pixelar, y es mucho más rápido que sobre-escalar a un tamaño fijo enorme
-    escala_previa = ancho * 2
+    # escala previa al zoompan: 1.5x el ancho objetivo es justo lo necesario
+    # para el zoom máximo de 1.5x sin pixelar — antes usaba 2x, que gastaba
+    # memoria de más sin aportar nada (causó un "out of memory" en Render Starter)
+    escala_previa = int(ancho * 1.5)
 
     cmd = ["ffmpeg", "-y"]
     for ruta in rutas_imagenes:
@@ -97,8 +106,9 @@ def construir_video_ffmpeg(rutas_imagenes, ruta_audio, ruta_salida, duracion_tot
         "-map", f"[{encadenado}]",
         "-map", f"{n}:a",
         "-c:v", "libx264",
-        "-preset", "veryfast",
-        "-crf", "20",
+        "-preset", "ultrafast",  # menos memoria de buffer que veryfast, clave en un server de 512MB RAM
+        "-threads", "2",
+        "-crf", "23",
         "-c:a", "aac",
         "-shortest",
         ruta_salida,
@@ -209,6 +219,8 @@ def procesar_activo(job_id, titulo, imagenes_urls, rutas_audio_partes, duracion_
     ruta_audio = f"audio_unido_{job_id}.mp3"
     ruta_srt = f"subtitulos_{job_id}.srt"
 
+    semaforo_render.acquire()
+    actualizar_estado(job_id, status="procesando")  # confirma que ya salió de la cola y arrancó de verdad
     try:
         # 0. Unir las partes de audio (ElevenLabs las manda separadas por el
         # límite de 10.000 caracteres por request; acá se juntan en un solo mp3)
@@ -299,6 +311,7 @@ def procesar_activo(job_id, titulo, imagenes_urls, rutas_audio_partes, duracion_
         notificar_webhook(webhook_url, resultado_error)
 
     finally:
+        semaforo_render.release()
         # Limpiar los archivos intermedios de este job
         rutas_a_borrar = [ruta_audio, ruta_miniatura, ruta_video_sin_subs, ruta_video, ruta_short, ruta_srt] + rutas_imagenes + rutas_audio_partes
         for ruta in rutas_a_borrar:
