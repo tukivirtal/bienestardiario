@@ -36,6 +36,15 @@ jobs_lock = threading.Lock()
 # los jobs de más simplemente esperan su turno en vez de competir por RAM.
 semaforo_render = threading.Semaphore(1)
 
+# Acumulador para el patrón "una URL por request, dispara el render en la
+# última". Reemplaza al Aggregator de Make (que tenía un bug de plataforma
+# confirmado — no cerraba el ciclo del Iterator, documentado en el foro
+# oficial de Make por otros usuarios con el mismo patrón). Clave: job_key
+# (usamos el número de fila del Sheet) -> dict con las URLs por posición y
+# los demás datos del job.
+acumuladores = {}
+acumuladores_lock = threading.Lock()
+
 
 def actualizar_estado(job_id, **campos):
     with jobs_lock:
@@ -322,6 +331,108 @@ def procesar_activo(job_id, titulo, imagenes_urls, rutas_audio_partes, duracion_
                 pass
 
 
+def _lanzar_render(titulo, lista_urls, rutas_audio_partes, duracion_short, webhook_url,
+                    descripcion_seo, hashtags, etiquetas_ocultas, fila):
+    """Registra el job y dispara procesar_activo en un hilo de fondo.
+    Compartido por /fabricar (llamada directa, para pruebas manuales) y por
+    /acumular_imagen (cuando ya juntó las N imágenes del Iterator)."""
+    job_id = uuid.uuid4().hex
+    actualizar_estado(job_id, status="procesando")
+    hilo = threading.Thread(
+        target=procesar_activo,
+        args=(job_id, titulo, lista_urls, rutas_audio_partes, duracion_short, webhook_url,
+              descripcion_seo, hashtags, etiquetas_ocultas, fila),
+        daemon=True,
+    )
+    hilo.start()
+    return job_id
+
+
+@app.route('/acumular_imagen', methods=['POST'])
+def acumular_imagen():
+    """Endpoint que Make llama UNA VEZ POR IMAGEN, adentro del loop del
+    Iterator (reemplaza al Aggregator de Make, que tenía un bug de
+    plataforma confirmado: no cerraba el ciclo del Iterator de forma
+    confiable — mismo síntoma reportado por otros usuarios en el foro
+    oficial de Make, sin solución en varios intentos).
+
+    Cada llamada manda: job_key (usamos el número de fila del Sheet, estable
+    por contenido), url (la imagen de ESTA iteración), posicion y total
+    (Bundle order position / Total number of bundles, que el Iterator ya
+    expone gratis). El resto de los campos (titulo, audio, webhook_url, etc.)
+    se mandan en TODAS las llamadas (son iguales en las 4, Make no permite
+    mandarlos solo en la última sin lógica extra) — Flask simplemente los
+    vuelve a guardar cada vez, sin problema porque el contenido es idéntico.
+
+    Cuando llega la última imagen (posicion == total), recién ahí se dispara
+    el render completo con las URLs ya ordenadas."""
+    job_key = request.form.get('job_key', '').strip()
+    url_imagen = request.form.get('url', '').strip()
+    try:
+        posicion = int(request.form.get('posicion', 0))
+        total = int(request.form.get('total', 0))
+    except ValueError:
+        return jsonify({"status": "error", "mensaje": "posicion/total inválidos"}), 400
+
+    if not job_key or not url_imagen or not posicion or not total:
+        return jsonify({"status": "error", "mensaje": "Faltan job_key, url, posicion o total"}), 400
+
+    titulo = request.form.get('titulo', 'EL SECRETO ESTOICO')
+    webhook_url = request.form.get('webhook_url')
+    descripcion_seo = request.form.get('descripcion_seo', '')
+    hashtags = request.form.get('hashtags', '')
+    etiquetas_ocultas = request.form.get('etiquetas_ocultas', '')
+    fila = request.form.get('fila', '')
+    try:
+        duracion_short = int(request.form.get('duracion_short', 45))
+    except ValueError:
+        duracion_short = 45
+
+    with acumuladores_lock:
+        entrada = acumuladores.setdefault(job_key, {"urls": {}, "meta": {}})
+        entrada["urls"][posicion] = url_imagen
+        entrada["meta"] = {
+            "titulo": titulo,
+            "webhook_url": webhook_url,
+            "descripcion_seo": descripcion_seo,
+            "hashtags": hashtags,
+            "etiquetas_ocultas": etiquetas_ocultas,
+            "fila": fila,
+            "duracion_short": duracion_short,
+        }
+        completo = len(entrada["urls"]) >= total
+
+    # Las partes de audio se guardan siempre con nombre fijo por job_key
+    # (se pisan en cada llamada con el mismo contenido, no hay problema:
+    # solo se usan de verdad recién cuando se dispara el render).
+    rutas_audio_partes = []
+    i = 1
+    while f'audio_parte_{i}' in request.files:
+        ruta_parte = f"audio_parte_{i}_{job_key}.mp3"
+        request.files[f'audio_parte_{i}'].save(ruta_parte)
+        rutas_audio_partes.append(ruta_parte)
+        i += 1
+
+    if not completo:
+        # Todavía faltan imágenes por llegar — solo confirmamos recepción.
+        return jsonify({"status": "acumulando", "recibidas": len(entrada["urls"]), "total": total}), 202
+
+    # Llegó la última — armamos la lista ordenada y disparamos el render.
+    with acumuladores_lock:
+        entrada = acumuladores.pop(job_key, entrada)
+    lista_urls = [entrada["urls"][pos] for pos in sorted(entrada["urls"])]
+    meta = entrada["meta"]
+
+    if not rutas_audio_partes:
+        return jsonify({"status": "error", "mensaje": "Faltan las partes de audio (audio_parte_1, audio_parte_2, ...)"}), 400
+
+    job_id = _lanzar_render(
+        meta["titulo"], lista_urls, rutas_audio_partes, meta["duracion_short"], meta["webhook_url"],
+        meta["descripcion_seo"], meta["hashtags"], meta["etiquetas_ocultas"], meta["fila"],
+    )
+    return jsonify({"job_id": job_id, "status": "render_iniciado"}), 202
+
+
 @app.route('/fabricar', methods=['POST'])
 def fabricar_activo():
     # 1. Desempaquetar los textos
@@ -346,11 +457,11 @@ def fabricar_activo():
         return jsonify({"status": "error", "mensaje": "Falta imagenes_urls"}), 400
 
     # 3. Guardar todas las partes de audio recibidas (audio_parte_1, audio_parte_2, ...)
-    job_id = uuid.uuid4().hex
+    job_id_temp = uuid.uuid4().hex
     rutas_audio_partes = []
     i = 1
     while f'audio_parte_{i}' in request.files:
-        ruta_parte = f"audio_parte_{i}_{job_id}.mp3"
+        ruta_parte = f"audio_parte_{i}_{job_id_temp}.mp3"
         request.files[f'audio_parte_{i}'].save(ruta_parte)
         rutas_audio_partes.append(ruta_parte)
         i += 1
@@ -359,14 +470,8 @@ def fabricar_activo():
         return jsonify({"status": "error", "mensaje": "Faltan las partes de audio (audio_parte_1, audio_parte_2, ...)"}), 400
 
     # 4. Registrar el job y disparar el procesamiento en segundo plano
-    actualizar_estado(job_id, status="procesando")
-    hilo = threading.Thread(
-        target=procesar_activo,
-        args=(job_id, titulo, lista_urls, rutas_audio_partes, duracion_short, webhook_url,
-              descripcion_seo, hashtags, etiquetas_ocultas, fila),
-        daemon=True,
-    )
-    hilo.start()
+    job_id = _lanzar_render(titulo, lista_urls, rutas_audio_partes, duracion_short, webhook_url,
+                             descripcion_seo, hashtags, etiquetas_ocultas, fila)
 
     # 5. Responder de inmediato
     return jsonify({"job_id": job_id}), 202
