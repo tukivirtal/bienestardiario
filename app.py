@@ -183,7 +183,15 @@ def generar_subtitulos(ruta_audio, ruta_srt, palabras_por_bloque=8):
         if not grupo:
             continue
         texto = " ".join(w["text"] for w in grupo)
-        bloques.append((grupo[0]["start"], grupo[-1]["end"], texto))
+        bloques.append([grupo[0]["start"], grupo[-1]["end"], texto])
+
+    # Corrige solapamientos: si el bloque N termina después de que arranca
+    # el N+1 (puede pasar por cómo ElevenLabs Scribe redondea los timestamps
+    # palabra por palabra), recorto el final del bloque N. Sin esto, libass
+    # muestra los dos subtítulos apilados al mismo tiempo en pantalla.
+    for i in range(len(bloques) - 1):
+        if bloques[i][1] > bloques[i + 1][0]:
+            bloques[i][1] = bloques[i + 1][0]
 
     with open(ruta_srt, "w", encoding="utf-8") as f:
         for idx, (inicio, fin, texto) in enumerate(bloques, start=1):
@@ -216,7 +224,7 @@ def quemar_subtitulos(ruta_video_entrada, ruta_srt, ruta_video_salida):
 
 
 def procesar_activo(job_id, titulo, imagenes_urls, rutas_audio_partes, duracion_short, webhook_url=None,
-                     descripcion_seo="", hashtags="", etiquetas_ocultas="", fila=""):
+                     descripcion_seo="", hashtags="", etiquetas_ocultas="", fila="", texto_miniatura=""):
     """Trabajo pesado que corre en un hilo de fondo. Usa rutas con el job_id
     para que jobs concurrentes no se pisen los archivos intermedios."""
     rutas_imagenes = [f"imagen_{job_id}_{i}.jpg" for i in range(len(imagenes_urls))]
@@ -251,7 +259,11 @@ def procesar_activo(job_id, titulo, imagenes_urls, rutas_audio_partes, duracion_
             dibujo = ImageDraw.Draw(imagen)
 
             ancho_img, alto_img = imagen.size
-            titulo_impacto = titulo.upper()
+            # Usa el gancho corto (texto_miniatura, máx. 4 palabras) en vez
+            # del título largo de SEO — son campos distintos que Claude
+            # genera por separado. Si por algún motivo no llega, usa el
+            # título como respaldo en vez de dejar la miniatura sin texto.
+            titulo_impacto = (texto_miniatura or titulo).upper()
             tamano_fuente = int(ancho_img * 0.07)
             fuente = ImageFont.truetype(ruta_fuente, tamano_fuente)
 
@@ -311,12 +323,12 @@ def procesar_activo(job_id, titulo, imagenes_urls, rutas_audio_partes, duracion_
             "etiquetas_ocultas": etiquetas_ocultas,
             "fila": fila,
         }
-        actualizar_estado(job_id, **resultado)
+        actualizar_estado(**resultado)
         notificar_webhook(webhook_url, resultado)
 
     except Exception as e:
         resultado_error = {"job_id": job_id, "status": "error", "mensaje": str(e), "fila": fila}
-        actualizar_estado(job_id, **resultado_error)
+        actualizar_estado(**resultado_error)
         notificar_webhook(webhook_url, resultado_error)
 
     finally:
@@ -332,7 +344,7 @@ def procesar_activo(job_id, titulo, imagenes_urls, rutas_audio_partes, duracion_
 
 
 def _lanzar_render(titulo, lista_urls, rutas_audio_partes, duracion_short, webhook_url,
-                    descripcion_seo, hashtags, etiquetas_ocultas, fila):
+                    descripcion_seo, hashtags, etiquetas_ocultas, fila, texto_miniatura=""):
     """Registra el job y dispara procesar_activo en un hilo de fondo.
     Compartido por /fabricar (llamada directa, para pruebas manuales) y por
     /acumular_imagen (cuando ya juntó las N imágenes del Iterator)."""
@@ -341,7 +353,7 @@ def _lanzar_render(titulo, lista_urls, rutas_audio_partes, duracion_short, webho
     hilo = threading.Thread(
         target=procesar_activo,
         args=(job_id, titulo, lista_urls, rutas_audio_partes, duracion_short, webhook_url,
-              descripcion_seo, hashtags, etiquetas_ocultas, fila),
+              descripcion_seo, hashtags, etiquetas_ocultas, fila, texto_miniatura),
         daemon=True,
     )
     hilo.start()
@@ -378,6 +390,7 @@ def acumular_imagen():
         return jsonify({"status": "error", "mensaje": "Faltan job_key, url, posicion o total"}), 400
 
     titulo = request.form.get('titulo', 'EL SECRETO ESTOICO')
+    texto_miniatura = request.form.get('texto_miniatura', '')
     webhook_url = request.form.get('webhook_url')
     descripcion_seo = request.form.get('descripcion_seo', '')
     hashtags = request.form.get('hashtags', '')
@@ -393,6 +406,7 @@ def acumular_imagen():
         entrada["urls"][posicion] = url_imagen
         entrada["meta"] = {
             "titulo": titulo,
+            "texto_miniatura": texto_miniatura,
             "webhook_url": webhook_url,
             "descripcion_seo": descripcion_seo,
             "hashtags": hashtags,
@@ -429,6 +443,7 @@ def acumular_imagen():
     job_id = _lanzar_render(
         meta["titulo"], lista_urls, rutas_audio_partes, meta["duracion_short"], meta["webhook_url"],
         meta["descripcion_seo"], meta["hashtags"], meta["etiquetas_ocultas"], meta["fila"],
+        meta.get("texto_miniatura", ""),
     )
     return jsonify({"job_id": job_id, "status": "render_iniciado"}), 202
 
@@ -437,6 +452,7 @@ def acumular_imagen():
 def fabricar_activo():
     # 1. Desempaquetar los textos
     titulo = request.form.get('titulo', 'EL SECRETO ESTOICO')
+    texto_miniatura = request.form.get('texto_miniatura', '')
     imagenes_urls_raw = request.form.get('imagenes_urls', '')
     lista_urls = [u.strip() for u in imagenes_urls_raw.split(',') if u.strip()]
     webhook_url = request.form.get('webhook_url')  # opcional: URL de callback de Make
@@ -471,7 +487,7 @@ def fabricar_activo():
 
     # 4. Registrar el job y disparar el procesamiento en segundo plano
     job_id = _lanzar_render(titulo, lista_urls, rutas_audio_partes, duracion_short, webhook_url,
-                             descripcion_seo, hashtags, etiquetas_ocultas, fila)
+                             descripcion_seo, hashtags, etiquetas_ocultas, fila, texto_miniatura)
 
     # 5. Responder de inmediato
     return jsonify({"job_id": job_id}), 202
