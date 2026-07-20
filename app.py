@@ -45,6 +45,16 @@ semaforo_render = threading.Semaphore(1)
 acumuladores = {}
 acumuladores_lock = threading.Lock()
 
+# --- Estilo visual de la miniatura ---------------------------------------
+# Franja azul muy oscuro / texto dorado-ámbar: mantiene la identidad calmada
+# del canal (en vez del amarillo/negro genérico de muchos canales
+# automatizados). Fácil de cambiar a amarillo/negro si un Test & Compare
+# real en YouTube muestra que convierte más.
+COLOR_FRANJA = (10, 25, 40)       # azul muy oscuro, casi negro-azulado
+COLOR_TEXTO = (230, 180, 90)      # dorado / ámbar suave
+COLOR_VERDE = (60, 200, 100)      # flecha (HAZ_ESTO)
+COLOR_ROJO = (220, 40, 40)        # X (ERROR)
+
 
 def actualizar_estado(job_id, **campos):
     with jobs_lock:
@@ -61,6 +71,74 @@ def notificar_webhook(webhook_url, resultado):
         requests.post(webhook_url, json=resultado, timeout=10)
     except Exception as e:
         print(f"Error notificando webhook: {e}")
+
+
+def generar_overlay_miniatura(ruta_imagen, texto_miniatura, estrategia_miniatura, color_acento, ruta_fuente, ruta_salida):
+    """Dibuja la miniatura final: una franja sólida en el tercio de la imagen
+    que el prompt de Leonardo ya dejó vacío para texto (izquierda para
+    ESTADO_PROBLEMA, arriba para las otras 3 estrategias), el texto centrado
+    dentro de esa franja, y una flecha (HAZ_ESTO) o una X (ERROR) marcando
+    el punto de interés sobre la imagen, según la estrategia elegida por
+    Claude para este video."""
+    imagen = Image.open(ruta_imagen).convert("RGB")
+    ancho_img, alto_img = imagen.size
+
+    if estrategia_miniatura == "ESTADO_PROBLEMA":
+        franja_rect = (0, 0, int(ancho_img * 0.35), alto_img)
+    else:
+        franja_rect = (0, 0, ancho_img, int(alto_img * 0.30))
+
+    overlay = Image.new("RGBA", imagen.size, (0, 0, 0, 0))
+    dibujo_overlay = ImageDraw.Draw(overlay)
+    dibujo_overlay.rectangle(franja_rect, fill=COLOR_FRANJA + (235,))
+    imagen = Image.alpha_composite(imagen.convert("RGBA"), overlay).convert("RGB")
+    dibujo = ImageDraw.Draw(imagen)
+
+    # Texto: tamaño dinámico (arranca en 7% del ancho, igual que antes) hasta
+    # que entre en el ancho disponible de la franja.
+    titulo_impacto = texto_miniatura.upper()
+    tamano_fuente = int(ancho_img * 0.07)
+    fuente = ImageFont.truetype(ruta_fuente, tamano_fuente)
+    ancho_franja = franja_rect[2] - franja_rect[0]
+    lineas = textwrap.wrap(titulo_impacto, width=14)
+
+    while True:
+        anchos = [dibujo.textbbox((0, 0), linea, font=fuente)[2] for linea in lineas]
+        if max(anchos, default=0) <= ancho_franja - 60 or tamano_fuente <= 40:
+            break
+        tamano_fuente -= 5
+        fuente = ImageFont.truetype(ruta_fuente, tamano_fuente)
+
+    alto_linea = tamano_fuente * 1.15
+    alto_total_texto = alto_linea * len(lineas)
+    centro_y = (franja_rect[1] + franja_rect[3]) / 2 - alto_total_texto / 2
+    centro_x = (franja_rect[0] + franja_rect[2]) / 2
+
+    for i, linea in enumerate(lineas):
+        ancho_linea = dibujo.textbbox((0, 0), linea, font=fuente)[2]
+        pos_x = centro_x - ancho_linea / 2
+        pos_y = centro_y + (i * alto_linea)
+        dibujo.text((pos_x, pos_y), linea, font=fuente, fill=COLOR_TEXTO)
+
+    # Flecha o X, fuera de la franja (sobre la zona de la imagen)
+    color_marca = COLOR_VERDE if color_acento == "verde" else COLOR_ROJO
+    if estrategia_miniatura == "HAZ_ESTO":
+        punto_inicio = (int(ancho_img * 0.40), int(alto_img * 0.45))
+        punto_fin = (int(ancho_img * 0.60), int(alto_img * 0.68))
+        dibujo.line([punto_inicio, punto_fin], fill=color_marca, width=12)
+        dibujo.polygon([
+            punto_fin,
+            (punto_fin[0] - 25, punto_fin[1] - 10),
+            (punto_fin[0] - 10, punto_fin[1] - 25),
+        ], fill=color_marca)
+    elif estrategia_miniatura == "ERROR":
+        x0, y0 = int(ancho_img * 0.72), int(alto_img * 0.55)
+        x1, y1 = int(ancho_img * 0.95), int(alto_img * 0.90)
+        dibujo.line([(x0, y0), (x1, y1)], fill=color_marca, width=18)
+        dibujo.line([(x0, y1), (x1, y0)], fill=color_marca, width=18)
+    # ANTES_DESPUES no lleva marca extra: la franja + texto alcanza.
+
+    imagen.save(ruta_salida, quality=95)
 
 
 def construir_video_ffmpeg(rutas_imagenes, ruta_audio, ruta_salida, duracion_total,
@@ -224,11 +302,13 @@ def quemar_subtitulos(ruta_video_entrada, ruta_srt, ruta_video_salida):
 
 
 def procesar_activo(job_id, titulo, imagenes_urls, rutas_audio_partes, duracion_short, webhook_url=None,
-                     descripcion_seo="", hashtags="", etiquetas_ocultas="", fila="", texto_miniatura=""):
+                     descripcion_seo="", hashtags="", etiquetas_ocultas="", fila="", texto_miniatura="",
+                     imagen_miniatura_url="", estrategia_miniatura="", color_acento="verde"):
     """Trabajo pesado que corre en un hilo de fondo. Usa rutas con el job_id
     para que jobs concurrentes no se pisen los archivos intermedios."""
     rutas_imagenes = [f"imagen_{job_id}_{i}.jpg" for i in range(len(imagenes_urls))]
     ruta_miniatura = f"miniatura_final_{job_id}.jpg"
+    ruta_imagen_miniatura_fuente = f"miniatura_fuente_{job_id}.jpg"
     ruta_video_sin_subs = f"video_sin_subs_{job_id}.mp4"
     ruta_video = f"video_final_{job_id}.mp4"
     ruta_short = f"short_{job_id}.mp4"
@@ -252,33 +332,28 @@ def procesar_activo(job_id, titulo, imagenes_urls, rutas_audio_partes, duracion_
             with open(ruta, 'wb') as f:
                 f.write(respuesta_img.content)
 
-        # 2. Fabricar la Miniatura (se arma con la PRIMERA imagen)
-        ruta_imagen_portada = rutas_imagenes[0]
-        if os.path.exists(ruta_fuente) and os.path.exists(ruta_imagen_portada):
-            imagen = Image.open(ruta_imagen_portada)
-            dibujo = ImageDraw.Draw(imagen)
+        # 2. Fabricar la Miniatura: usa la imagen DEDICADA de Leonardo
+        # (generada con prompt_miniatura) si llegó su URL; si no, cae al
+        # comportamiento anterior (reusar la primera imagen de escena) para
+        # no romper corridas viejas o filas que todavía no manden ese campo.
+        if imagen_miniatura_url:
+            respuesta_mini = requests.get(imagen_miniatura_url)
+            with open(ruta_imagen_miniatura_fuente, 'wb') as f:
+                f.write(respuesta_mini.content)
+        else:
+            ruta_imagen_miniatura_fuente = rutas_imagenes[0]
 
-            ancho_img, alto_img = imagen.size
+        if os.path.exists(ruta_fuente) and os.path.exists(ruta_imagen_miniatura_fuente):
             # Usa el gancho corto (texto_miniatura, máx. 4 palabras) en vez
             # del título largo de SEO — son campos distintos que Claude
             # genera por separado. Si por algún motivo no llega, usa el
             # título como respaldo en vez de dejar la miniatura sin texto.
-            titulo_impacto = (texto_miniatura or titulo).upper()
-            tamano_fuente = int(ancho_img * 0.07)
-            fuente = ImageFont.truetype(ruta_fuente, tamano_fuente)
-
-            lineas = textwrap.wrap(titulo_impacto, width=14)
-
-            pos_x = ancho_img * 0.05
-            pos_y = alto_img * 0.15
-            alto_linea = tamano_fuente * 1.15
-
-            for i, linea in enumerate(lineas):
-                y_actual = pos_y + (i * alto_linea)
-                dibujo.text((pos_x + 4, y_actual + 4), linea, font=fuente, fill="black")
-                dibujo.text((pos_x, y_actual), linea, font=fuente, fill="#ffde59")
-
-            imagen.save(ruta_miniatura)
+            titulo_impacto = texto_miniatura or titulo
+            generar_overlay_miniatura(
+                ruta_imagen_miniatura_fuente, titulo_impacto,
+                estrategia_miniatura or "ESTADO_PROBLEMA", color_acento or "verde",
+                ruta_fuente, ruta_miniatura,
+            )
 
         # 3. Fabricar el Video: multi-imagen + Ken Burns (zoompan) + crossfade (xfade),
         # todo vía ffmpeg directo — reemplaza el pipeline anterior de moviepy/PIL.
@@ -334,7 +409,10 @@ def procesar_activo(job_id, titulo, imagenes_urls, rutas_audio_partes, duracion_
     finally:
         semaforo_render.release()
         # Limpiar los archivos intermedios de este job
-        rutas_a_borrar = [ruta_audio, ruta_miniatura, ruta_video_sin_subs, ruta_video, ruta_short, ruta_srt] + rutas_imagenes + rutas_audio_partes
+        rutas_a_borrar = (
+            [ruta_audio, ruta_miniatura, ruta_imagen_miniatura_fuente, ruta_video_sin_subs,
+             ruta_video, ruta_short, ruta_srt] + rutas_imagenes + rutas_audio_partes
+        )
         for ruta in rutas_a_borrar:
             try:
                 if os.path.exists(ruta):
@@ -344,7 +422,8 @@ def procesar_activo(job_id, titulo, imagenes_urls, rutas_audio_partes, duracion_
 
 
 def _lanzar_render(titulo, lista_urls, rutas_audio_partes, duracion_short, webhook_url,
-                    descripcion_seo, hashtags, etiquetas_ocultas, fila, texto_miniatura=""):
+                    descripcion_seo, hashtags, etiquetas_ocultas, fila, texto_miniatura="",
+                    imagen_miniatura_url="", estrategia_miniatura="", color_acento="verde"):
     """Registra el job y dispara procesar_activo en un hilo de fondo.
     Compartido por /fabricar (llamada directa, para pruebas manuales) y por
     /acumular_imagen (cuando ya juntó las N imágenes del Iterator)."""
@@ -353,7 +432,8 @@ def _lanzar_render(titulo, lista_urls, rutas_audio_partes, duracion_short, webho
     hilo = threading.Thread(
         target=procesar_activo,
         args=(job_id, titulo, lista_urls, rutas_audio_partes, duracion_short, webhook_url,
-              descripcion_seo, hashtags, etiquetas_ocultas, fila, texto_miniatura),
+              descripcion_seo, hashtags, etiquetas_ocultas, fila, texto_miniatura,
+              imagen_miniatura_url, estrategia_miniatura, color_acento),
         daemon=True,
     )
     hilo.start()
@@ -391,6 +471,9 @@ def acumular_imagen():
 
     titulo = request.form.get('titulo', 'EL SECRETO ESTOICO')
     texto_miniatura = request.form.get('texto_miniatura', '')
+    imagen_miniatura_url = request.form.get('imagen_miniatura_url', '')
+    estrategia_miniatura = request.form.get('estrategia_miniatura', '')
+    color_acento = request.form.get('color_acento', 'verde')
     webhook_url = request.form.get('webhook_url')
     descripcion_seo = request.form.get('descripcion_seo', '')
     hashtags = request.form.get('hashtags', '')
@@ -407,6 +490,9 @@ def acumular_imagen():
         entrada["meta"] = {
             "titulo": titulo,
             "texto_miniatura": texto_miniatura,
+            "imagen_miniatura_url": imagen_miniatura_url,
+            "estrategia_miniatura": estrategia_miniatura,
+            "color_acento": color_acento,
             "webhook_url": webhook_url,
             "descripcion_seo": descripcion_seo,
             "hashtags": hashtags,
@@ -443,7 +529,8 @@ def acumular_imagen():
     job_id = _lanzar_render(
         meta["titulo"], lista_urls, rutas_audio_partes, meta["duracion_short"], meta["webhook_url"],
         meta["descripcion_seo"], meta["hashtags"], meta["etiquetas_ocultas"], meta["fila"],
-        meta.get("texto_miniatura", ""),
+        meta.get("texto_miniatura", ""), meta.get("imagen_miniatura_url", ""),
+        meta.get("estrategia_miniatura", ""), meta.get("color_acento", "verde"),
     )
     return jsonify({"job_id": job_id, "status": "render_iniciado"}), 202
 
@@ -453,6 +540,9 @@ def fabricar_activo():
     # 1. Desempaquetar los textos
     titulo = request.form.get('titulo', 'EL SECRETO ESTOICO')
     texto_miniatura = request.form.get('texto_miniatura', '')
+    imagen_miniatura_url = request.form.get('imagen_miniatura_url', '')
+    estrategia_miniatura = request.form.get('estrategia_miniatura', '')
+    color_acento = request.form.get('color_acento', 'verde')
     imagenes_urls_raw = request.form.get('imagenes_urls', '')
     lista_urls = [u.strip() for u in imagenes_urls_raw.split(',') if u.strip()]
     webhook_url = request.form.get('webhook_url')  # opcional: URL de callback de Make
@@ -487,7 +577,8 @@ def fabricar_activo():
 
     # 4. Registrar el job y disparar el procesamiento en segundo plano
     job_id = _lanzar_render(titulo, lista_urls, rutas_audio_partes, duracion_short, webhook_url,
-                             descripcion_seo, hashtags, etiquetas_ocultas, fila, texto_miniatura)
+                             descripcion_seo, hashtags, etiquetas_ocultas, fila, texto_miniatura,
+                             imagen_miniatura_url, estrategia_miniatura, color_acento)
 
     # 5. Responder de inmediato
     return jsonify({"job_id": job_id}), 202
