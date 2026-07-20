@@ -206,14 +206,18 @@ def construir_video_ffmpeg(rutas_imagenes, ruta_audio, ruta_salida, duracion_tot
         raise RuntimeError(f"ffmpeg falló al construir el video: {resultado.stderr[-2000:]}")
 
 
-def generar_short(ruta_video_largo, ruta_short, duracion_short=45):
-    """Recorta los primeros N segundos del video largo y lo recompone en
-    vertical 9:16, recortando desde el centro del cuadro horizontal.
+def generar_short(ruta_video_sin_subs, ruta_short, duracion_short=45):
+    """Recorta los primeros N segundos del video (SIN subtítulos quemados)
+    y lo recompone en vertical 9:16, recortando desde el centro del cuadro
+    horizontal. Los subtítulos del Short se queman DESPUÉS de este recorte,
+    no antes — si se queman antes (sobre el horizontal completo) y después
+    se recorta a una tira vertical angosta, el texto centrado para el ancho
+    completo queda literalmente cortado en los bordes al recortar.
     Usa ffmpeg directo (crop + trim) en vez de moviepy, mismo motivo: velocidad."""
     filtro_crop = "crop=ih*9/16:ih:(iw-ih*9/16)/2:0"
     cmd = [
         "ffmpeg", "-y",
-        "-i", ruta_video_largo,
+        "-i", ruta_video_sin_subs,
         "-t", str(duracion_short),
         "-vf", filtro_crop,
         "-c:v", "libx264",
@@ -237,12 +241,47 @@ def _formato_srt(segundos):
     return f"{horas:02d}:{minutos:02d}:{segs:02d},{milisegundos:03d}"
 
 
+def _agrupar_en_bloques(palabras, palabras_por_bloque):
+    """Agrupa una lista de palabras con timestamp (formato ElevenLabs Scribe)
+    en bloques de N palabras, con corrección de solapamientos (si el bloque
+    N termina después de que arranca el N+1, recorta el final del bloque N
+    — sin esto, libass muestra dos subtítulos apilados al mismo tiempo).
+    Reutilizado tanto para el video largo (bloques de 8) como para el Short
+    (bloques de 4, más cortos, más cómodos en un cuadro angosto)."""
+    bloques = []
+    for i in range(0, len(palabras), palabras_por_bloque):
+        grupo = palabras[i:i + palabras_por_bloque]
+        if not grupo:
+            continue
+        texto = " ".join(w["text"] for w in grupo)
+        bloques.append([grupo[0]["start"], grupo[-1]["end"], texto])
+
+    for i in range(len(bloques) - 1):
+        if bloques[i][1] > bloques[i + 1][0]:
+            bloques[i][1] = bloques[i + 1][0]
+
+    return bloques
+
+
+def _escribir_srt(bloques, ruta_srt):
+    with open(ruta_srt, "w", encoding="utf-8") as f:
+        for idx, (inicio, fin, texto) in enumerate(bloques, start=1):
+            f.write(f"{idx}\n")
+            f.write(f"{_formato_srt(inicio)} --> {_formato_srt(fin)}\n")
+            f.write(f"{texto}\n\n")
+
+
 def generar_subtitulos(ruta_audio, ruta_srt, palabras_por_bloque=8):
     """Transcribe el audio con ElevenLabs Scribe (mismo proveedor/cuenta que
     ya usás para la narración, evita pelear con tarjetas rechazadas en otro
     proveedor). A diferencia de Whisper de OpenAI, esta API no devuelve el
     .srt directo — da timestamps palabra por palabra, así que los agrupamos
-    en bloques de N palabras y armamos el .srt nosotros."""
+    en bloques de N palabras y armamos el .srt nosotros.
+
+    Devuelve (bloques, palabras) — bloques para armar el .srt del video largo
+    y para encontrar_corte_natural(); palabras (timestamps crudos) para poder
+    armar un .srt distinto (bloques más cortos) para el Short, sin tener que
+    llamar a la API de nuevo."""
     api_key = os.environ.get("ELEVENLABS_API_KEY")
     with open(ruta_audio, "rb") as f:
         respuesta = requests.post(
@@ -255,29 +294,10 @@ def generar_subtitulos(ruta_audio, ruta_srt, palabras_por_bloque=8):
     respuesta.raise_for_status()
     palabras = [w for w in respuesta.json().get("words", []) if w.get("type") == "word"]
 
-    bloques = []
-    for i in range(0, len(palabras), palabras_por_bloque):
-        grupo = palabras[i:i + palabras_por_bloque]
-        if not grupo:
-            continue
-        texto = " ".join(w["text"] for w in grupo)
-        bloques.append([grupo[0]["start"], grupo[-1]["end"], texto])
+    bloques = _agrupar_en_bloques(palabras, palabras_por_bloque)
+    _escribir_srt(bloques, ruta_srt)
 
-    # Corrige solapamientos: si el bloque N termina después de que arranca
-    # el N+1 (puede pasar por cómo ElevenLabs Scribe redondea los timestamps
-    # palabra por palabra), recorto el final del bloque N. Sin esto, libass
-    # muestra los dos subtítulos apilados al mismo tiempo en pantalla.
-    for i in range(len(bloques) - 1):
-        if bloques[i][1] > bloques[i + 1][0]:
-            bloques[i][1] = bloques[i + 1][0]
-
-    with open(ruta_srt, "w", encoding="utf-8") as f:
-        for idx, (inicio, fin, texto) in enumerate(bloques, start=1):
-            f.write(f"{idx}\n")
-            f.write(f"{_formato_srt(inicio)} --> {_formato_srt(fin)}\n")
-            f.write(f"{texto}\n\n")
-
-    return bloques
+    return bloques, palabras
 
 
 def encontrar_corte_natural(bloques, duracion_objetivo, tolerancia=5.0):
@@ -318,13 +338,27 @@ def encontrar_corte_natural(bloques, duracion_objetivo, tolerancia=5.0):
     return duracion_objetivo
 
 
-def quemar_subtitulos(ruta_video_entrada, ruta_srt, ruta_video_salida):
+ESTILO_SUBTITULOS_LARGO = (
+    "FontName=Arial,FontSize=22,PrimaryColour=&H00FFFFFF,"
+    "OutlineColour=&H00000000,BorderStyle=3,Outline=2,Alignment=2,MarginV=60"
+)
+
+# Fuente más grande para el Short: el cuadro es angosto (9:16), así que hay
+# menos ancho disponible por línea — compensamos con bloques de menos
+# palabras (ver palabras_por_bloque=4 más abajo) y una fuente algo mayor,
+# más cómoda de leer en pantalla de celular.
+ESTILO_SUBTITULOS_SHORT = (
+    "FontName=Arial,FontSize=26,PrimaryColour=&H00FFFFFF,"
+    "OutlineColour=&H00000000,BorderStyle=3,Outline=2,Alignment=2,MarginV=80"
+)
+
+
+def quemar_subtitulos(ruta_video_entrada, ruta_srt, ruta_video_salida, estilo=None):
     """Quema los subtítulos sobre el video ya renderizado (filtro subtitles,
-    vía libass). Estilo: blanco con borde negro, centrado abajo."""
-    estilo = (
-        "FontName=Arial,FontSize=22,PrimaryColour=&H00FFFFFF,"
-        "OutlineColour=&H00000000,BorderStyle=3,Outline=2,Alignment=2,MarginV=60"
-    )
+    vía libass). Estilo por defecto: blanco con borde negro, centrado abajo
+    — pensado para el ancho del video horizontal. Para el Short, pasar
+    estilo=ESTILO_SUBTITULOS_SHORT (fuente más grande, bloques más cortos)."""
+    estilo = estilo or ESTILO_SUBTITULOS_LARGO
     filtro = f"subtitles={ruta_srt}:force_style='{estilo}'"
     cmd = [
         "ffmpeg", "-y",
@@ -352,6 +386,8 @@ def procesar_activo(job_id, titulo, imagenes_urls, rutas_audio_partes, duracion_
     ruta_video_sin_subs = f"video_sin_subs_{job_id}.mp4"
     ruta_video = f"video_final_{job_id}.mp4"
     ruta_short = f"short_{job_id}.mp4"
+    ruta_short_sin_subs = f"short_sin_subs_{job_id}.mp4"
+    ruta_srt_short = f"subtitulos_short_{job_id}.srt"
     ruta_fuente = "Anton-Regular.ttf"
     ruta_audio = f"audio_unido_{job_id}.mp3"
     ruta_srt = f"subtitulos_{job_id}.srt"
@@ -401,18 +437,29 @@ def procesar_activo(job_id, titulo, imagenes_urls, rutas_audio_partes, duracion_
         construir_video_ffmpeg(rutas_imagenes, ruta_audio, ruta_video_sin_subs, duracion_total)
 
         # 3.5. Transcribir el audio con ElevenLabs Scribe para generar los subtítulos
-        bloques_subtitulos = generar_subtitulos(ruta_audio, ruta_srt)
+        bloques_subtitulos, palabras_subtitulos = generar_subtitulos(ruta_audio, ruta_srt)
 
-        # 3.6. Quemar los subtítulos sobre el video ya renderizado
+        # 3.6. Quemar los subtítulos sobre el video largo ya renderizado
         quemar_subtitulos(ruta_video_sin_subs, ruta_srt, ruta_video)
 
-        # 4. Generar el Short: corte "inteligente" a partir del video largo
-        # YA CON subtítulos quemados. En vez de cortar a ciegas en el segundo
-        # duracion_short (podía caer a mitad de palabra o de frase), reusa
-        # los mismos timestamps de ElevenLabs Scribe para cortar al final de
-        # un bloque de palabras real, lo más cerca posible del target.
+        # 4. Generar el Short: corte "inteligente" a partir del video SIN
+        # subtítulos (video_sin_subs), no del video largo ya subtitulado —
+        # así el recorte a vertical pasa primero, y los subtítulos se queman
+        # DESPUÉS sobre el cuadro angosto ya recortado. En el orden anterior
+        # (subtitular sobre el horizontal completo y recortar después), el
+        # texto centrado para el ancho completo quedaba cortado en los bordes
+        # al angostar el cuadro a 9:16.
         corte_short = encontrar_corte_natural(bloques_subtitulos, duracion_short)
-        generar_short(ruta_video, ruta_short, duracion_short=corte_short)
+        generar_short(ruta_video_sin_subs, ruta_short_sin_subs, duracion_short=corte_short)
+
+        # 4.5. Armar un .srt propio para el Short, con bloques de 4 palabras
+        # (en vez de 8) — se leen mejor en un cuadro angosto. Reusa los
+        # timestamps ya obtenidos de ElevenLabs Scribe, filtrados a la
+        # duración real del corte — no hace falta llamar la API de nuevo.
+        palabras_del_short = [w for w in palabras_subtitulos if w["start"] < corte_short]
+        bloques_short = _agrupar_en_bloques(palabras_del_short, palabras_por_bloque=4)
+        _escribir_srt(bloques_short, ruta_srt_short)
+        quemar_subtitulos(ruta_short_sin_subs, ruta_srt_short, ruta_short, estilo=ESTILO_SUBTITULOS_SHORT)
 
         # 5. Subida Automática a Cloudinary (video largo + miniatura + short)
         url_miniatura_publica = ""
@@ -456,7 +503,8 @@ def procesar_activo(job_id, titulo, imagenes_urls, rutas_audio_partes, duracion_
         # Limpiar los archivos intermedios de este job
         rutas_a_borrar = (
             [ruta_audio, ruta_miniatura, ruta_imagen_miniatura_fuente, ruta_video_sin_subs,
-             ruta_video, ruta_short, ruta_srt] + rutas_imagenes + rutas_audio_partes
+             ruta_video, ruta_short, ruta_short_sin_subs, ruta_srt, ruta_srt_short]
+            + rutas_imagenes + rutas_audio_partes
         )
         for ruta in rutas_a_borrar:
             try:
