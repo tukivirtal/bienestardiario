@@ -277,6 +277,46 @@ def generar_subtitulos(ruta_audio, ruta_srt, palabras_por_bloque=8):
             f.write(f"{_formato_srt(inicio)} --> {_formato_srt(fin)}\n")
             f.write(f"{texto}\n\n")
 
+    return bloques
+
+
+def encontrar_corte_natural(bloques, duracion_objetivo, tolerancia=5.0):
+    """Busca el mejor segundo para cortar el Short cerca de duracion_objetivo,
+    usando los mismos bloques de timestamps que ya arma generar_subtitulos()
+    para los subtítulos — así el corte cae siempre al final de un bloque de
+    palabras real, nunca a mitad de una palabra o frase.
+
+    Preferencia: el último bloque, dentro de la ventana
+    [duracion_objetivo - tolerancia, duracion_objetivo + tolerancia], cuyo
+    texto termine en puntuación de cierre de frase (. ! ?) — para que el
+    Short cierre una idea, no la corte. Si no hay ninguno así en la ventana,
+    cae al último bloque que termine antes de duracion_objetivo + tolerancia
+    (evita cortar a mitad de palabra, aunque no cierre una frase completa).
+    """
+    if not bloques:
+        return duracion_objetivo
+
+    limite_superior = duracion_objetivo + tolerancia
+    limite_inferior = max(0.0, duracion_objetivo - tolerancia)
+
+    candidatos_en_ventana = [b for b in bloques if limite_inferior <= b[1] <= limite_superior]
+
+    for bloque in reversed(candidatos_en_ventana):
+        texto = bloque[2].strip()
+        if texto.endswith((".", "!", "?")):
+            return bloque[1]
+
+    if candidatos_en_ventana:
+        return candidatos_en_ventana[-1][1]
+
+    # Ningún bloque cayó en la ventana de tolerancia (guion muy corto, etc.)
+    # — último recurso: el último bloque que termine antes del límite superior.
+    anteriores = [b for b in bloques if b[1] <= limite_superior]
+    if anteriores:
+        return anteriores[-1][1]
+
+    return duracion_objetivo
+
 
 def quemar_subtitulos(ruta_video_entrada, ruta_srt, ruta_video_salida):
     """Quema los subtítulos sobre el video ya renderizado (filtro subtitles,
@@ -361,13 +401,18 @@ def procesar_activo(job_id, titulo, imagenes_urls, rutas_audio_partes, duracion_
         construir_video_ffmpeg(rutas_imagenes, ruta_audio, ruta_video_sin_subs, duracion_total)
 
         # 3.5. Transcribir el audio con ElevenLabs Scribe para generar los subtítulos
-        generar_subtitulos(ruta_audio, ruta_srt)
+        bloques_subtitulos = generar_subtitulos(ruta_audio, ruta_srt)
 
         # 3.6. Quemar los subtítulos sobre el video ya renderizado
         quemar_subtitulos(ruta_video_sin_subs, ruta_srt, ruta_video)
 
-        # 4. Generar el Short a partir del video largo YA CON subtítulos quemados
-        generar_short(ruta_video, ruta_short, duracion_short=duracion_short)
+        # 4. Generar el Short: corte "inteligente" a partir del video largo
+        # YA CON subtítulos quemados. En vez de cortar a ciegas en el segundo
+        # duracion_short (podía caer a mitad de palabra o de frase), reusa
+        # los mismos timestamps de ElevenLabs Scribe para cortar al final de
+        # un bloque de palabras real, lo más cerca posible del target.
+        corte_short = encontrar_corte_natural(bloques_subtitulos, duracion_short)
+        generar_short(ruta_video, ruta_short, duracion_short=corte_short)
 
         # 5. Subida Automática a Cloudinary (video largo + miniatura + short)
         url_miniatura_publica = ""
